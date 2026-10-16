@@ -9,15 +9,17 @@ import threading
 import time
 import tkinter as tk
 from collections import deque
-from tkinter import font as tkfont, messagebox, ttk
+from tkinter import filedialog, font as tkfont, messagebox, ttk
 
 import psutil
 
 from taskpatrol import APP_ID, DISPLAY_NAME, INSTALLER_GUID, __version__
-from taskpatrol import winutil
+from taskpatrol import filewatch, winutil
 from taskpatrol.sampler import Sampler
 
 LOG_NAME = "process_activity_log.txt"
+FILE_LOG_NAME = "file_activity_log.txt"
+WHEEL_LINES = 5  # rows per mouse-wheel notch in every list
 
 # Killing any of these usually blue-screens or logs the user out.
 PROTECTED = {
@@ -45,8 +47,12 @@ def fmt_duration(seconds):
     return f"{days}d {hours:02d}:{minutes:02d}" if days else f"{hours:02d}:{minutes:02d}"
 
 
-def setup_activity_logger(path):
-    logger = logging.getLogger("taskpatrol.activity")
+def fmt_rate(bps):
+    return "0" if bps < 1 else f"{filewatch.fmt_bytes(bps)}/s"
+
+
+def setup_activity_logger(path, name="taskpatrol.activity"):
+    logger = logging.getLogger(name)
     logger.setLevel(logging.INFO)
     logger.propagate = False
     handler = logging.handlers.RotatingFileHandler(path, maxBytes=5 * 1024 * 1024, backupCount=5, encoding="utf-8")
@@ -108,6 +114,22 @@ def apply_theme(root):
     style.configure("Status.TLabel", background=C["panel"], foreground=C["muted"])
     style.configure("StatusLink.TButton", background=C["panel"], foreground=C["accent"], padding=(8, 0))
     style.map("StatusLink.TButton", background=[("active", C["panel"])], foreground=[("active", C["fg"])])
+
+
+def fast_scroll(widget, lines=WHEEL_LINES):
+    """Faster mouse-wheel scrolling than the Tk default (the old FastScrollView idea)."""
+    def on_wheel(event):
+        if event.num == 4:
+            steps = -1
+        elif event.num == 5:
+            steps = 1
+        else:
+            steps = -1 if event.delta > 0 else 1
+        widget.yview_scroll(steps * lines, "units")
+        return "break"
+    widget.bind("<MouseWheel>", on_wheel)
+    widget.bind("<Button-4>", on_wheel)
+    widget.bind("<Button-5>", on_wheel)
 
 
 def themed_menu(parent):
@@ -188,6 +210,8 @@ class ProcessesTab(ttk.Frame):
         ("user", "User", 200, "w"),
         ("cpu", "CPU %", 70, "e"),
         ("mem", "Memory", 100, "e"),
+        ("read", "Disk read", 90, "e"),
+        ("write", "Disk write", 90, "e"),
         ("threads", "Threads", 70, "e"),
         ("status", "Status", 90, "w"),
     )
@@ -197,6 +221,8 @@ class ProcessesTab(ttk.Frame):
         "user": lambda p: (p.user.lower(), p.name.lower()),
         "cpu": lambda p: (p.cpu, p.mem_mb),
         "mem": lambda p: p.mem_mb,
+        "read": lambda p: p.read_bps,
+        "write": lambda p: p.write_bps,
         "threads": lambda p: p.threads,
         "status": lambda p: (p.status, p.name.lower()),
     }
@@ -240,6 +266,7 @@ class ProcessesTab(ttk.Frame):
         self.tree.configure(yscrollcommand=scroll.set)
         self.tree.pack(side="left", fill="both", expand=True)
         scroll.pack(side="right", fill="y")
+        fast_scroll(self.tree)
         self._update_headings()
 
         self.menu = themed_menu(self)
@@ -272,7 +299,8 @@ class ProcessesTab(ttk.Frame):
             tree.delete(*stale)
         for pid, p in visible.items():
             iid = str(pid)
-            values = (p.name, pid, p.user or "—", f"{p.cpu:.1f}", fmt_mem(p.mem_mb), p.threads, p.status)
+            values = (p.name, pid, p.user or "—", f"{p.cpu:.1f}", fmt_mem(p.mem_mb),
+                      fmt_rate(p.read_bps), fmt_rate(p.write_bps), p.threads, p.status)
             tags = ("hot",) if p.cpu >= 20 else ("system",) if p.name.lower() in PROTECTED else ()
             if pid not in self.rows or not tree.exists(iid):
                 tree.insert("", "end", iid=iid, values=values, tags=tags)
@@ -295,7 +323,7 @@ class ProcessesTab(ttk.Frame):
             self.sort_desc = not self.sort_desc
         else:
             self.sort_col = key
-            self.sort_desc = key in ("cpu", "mem", "threads")
+            self.sort_desc = key in ("cpu", "mem", "read", "write", "threads")
         self._update_headings()
         self.render()
 
@@ -477,6 +505,8 @@ class PerformanceTab(ttk.Frame):
         self.core_bars.set(snap.per_cpu)
         uptime = time.time() - psutil.boot_time()
         self.sysinfo.configure(text=f"{len(snap.procs)} processes · up {fmt_duration(uptime)} · "
+                                    f"disk read {fmt_rate(snap.disk_read_bps)} · "
+                                    f"disk write {fmt_rate(snap.disk_write_bps)} · "
                                     f"updated {snap.time:%H:%M:%S}")
 
 
@@ -525,6 +555,7 @@ class ActivityTab(ttk.Frame):
         self.tree.configure(yscrollcommand=scroll.set)
         self.tree.pack(side="left", fill="both", expand=True)
         scroll.pack(side="right", fill="y")
+        fast_scroll(self.tree)
         self.baseline = ""
 
     def update_snapshot(self, snap):
@@ -596,6 +627,213 @@ class ActivityTab(ttk.Frame):
                                     f"{self.counts['STOPPED']} stopped  ·  log: {self.log_path}")
 
 
+class FilesTab(ttk.Frame):
+    """Which processes open, close and read/write files in a folder (default: your user folder)."""
+
+    MAX_ROWS = 5000
+
+    def __init__(self, parent, app):
+        super().__init__(parent, padding=10)
+        self.app = app
+        self.watcher = None
+        self.root_dir = os.path.expanduser("~")
+        self.events = deque(maxlen=50000)
+        self.counts = {"OPENED": 0, "CLOSED": 0, "ACTIVITY": 0}
+        self.log_path = winutil.data_dir() / FILE_LOG_NAME
+        self.logger = setup_activity_logger(self.log_path, "taskpatrol.files")
+        self.write_log = tk.BooleanVar(value=True)
+        self.autoscroll = tk.BooleanVar(value=True)
+        self.skip_appdata = tk.BooleanVar(value=True)
+        self.query = tk.StringVar()
+        self.kind = tk.StringVar(value="All")
+        self.query.trace_add("write", lambda *a: self.rebuild())
+
+        bar = ttk.Frame(self)
+        bar.pack(fill="x", pady=(0, 6))
+        self.toggle = ttk.Button(bar, text="Start watching", command=self.toggle_watch)
+        self.toggle.pack(side="left")
+        ttk.Button(bar, text="Folder…", command=self.choose_folder).pack(side="left", padx=(6, 6))
+        ttk.Checkbutton(bar, text="Skip AppData / caches", variable=self.skip_appdata,
+                        command=self._restart_if_running).pack(side="left", padx=(0, 12))
+        ttk.Label(bar, text="Filter").pack(side="left")
+        ttk.Entry(bar, textvariable=self.query, width=22).pack(side="left", padx=(6, 8))
+        kind = ttk.Combobox(bar, textvariable=self.kind, values=("All", "Opened", "Closed", "Activity"),
+                            state="readonly", width=9)
+        kind.pack(side="left")
+        kind.bind("<<ComboboxSelected>>", lambda e: self.rebuild())
+        ttk.Button(bar, text="Clear", command=self.clear).pack(side="right")
+        ttk.Button(bar, text="Open log", command=self.open_log).pack(side="right", padx=(0, 6))
+
+        bar2 = ttk.Frame(self)
+        bar2.pack(fill="x", pady=(0, 6))
+        ttk.Checkbutton(bar2, text="Auto-scroll", variable=self.autoscroll).pack(side="left")
+        ttk.Checkbutton(bar2, text="Write to log file", variable=self.write_log).pack(side="left", padx=(8, 0))
+        self.summary = ttk.Label(bar2, style="Muted.TLabel")
+        self.summary.pack(side="left", padx=12)
+
+        body = ttk.Frame(self)
+        body.pack(fill="both", expand=True)
+        cols = (("time", "Time", 150, "w"), ("event", "Event", 80, "w"), ("path", "File", 420, "w"),
+                ("name", "Process", 160, "w"), ("pid", "PID", 70, "e"), ("detail", "Detail", 180, "w"))
+        self.tree = ttk.Treeview(body, columns=[c[0] for c in cols], show="headings")
+        for key, title, width, anchor in cols:
+            self.tree.heading(key, text=title, anchor=anchor)
+            self.tree.column(key, width=width, anchor=anchor, stretch=key in ("path", "detail"))
+        self.tree.tag_configure("OPENED", foreground=C["green"])
+        self.tree.tag_configure("CLOSED", foreground=C["red"])
+        self.tree.tag_configure("ACTIVITY", foreground=C["accent"])
+        scroll = ttk.Scrollbar(body, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=scroll.set)
+        self.tree.pack(side="left", fill="both", expand=True)
+        scroll.pack(side="right", fill="y")
+        fast_scroll(self.tree)
+
+        self.menu = themed_menu(self)
+        self.menu.add_command(label="Open file location", command=self.open_location)
+        self.menu.add_command(label="Copy path", command=self.copy_path)
+        self.tree.bind("<Button-3>", self._popup)
+        self.tree.bind("<Double-1>", lambda e: self.open_location())
+        self.status = "Stopped. Shows which programs open, close, read and write your files."
+        self._update_summary()
+
+    # --- watching --------------------------------------------------------
+
+    def toggle_watch(self):
+        if self.watcher:
+            self.stop_watch()
+        else:
+            self.start_watch()
+
+    def start_watch(self):
+        ignores = filewatch.default_ignores(os.path.expanduser("~")) if self.skip_appdata.get() else ()
+        self.watcher = filewatch.FileWatcher(self.root_dir, ignores=ignores, interval=2.0)
+        self.watcher.start()
+        self.toggle.configure(text="Stop watching")
+        self.status = f"Scanning {self.root_dir} …"
+        if self.write_log.get():
+            self.logger.info(f"WATCH STARTED: {self.root_dir}")
+        self._update_summary()
+
+    def stop_watch(self):
+        if self.watcher:
+            self.watcher.stop()
+            self.watcher = None
+            if self.write_log.get():
+                self.logger.info("WATCH STOPPED")
+        self.toggle.configure(text="Start watching")
+        self.status = "Stopped."
+        self._update_summary()
+
+    def _restart_if_running(self):
+        if self.watcher:
+            self.stop_watch()
+            self.start_watch()
+
+    def choose_folder(self):
+        folder = filedialog.askdirectory(parent=self, initialdir=self.root_dir, title="Folder to watch")
+        if folder:
+            self.root_dir = os.path.normpath(folder)
+            self._restart_if_running()
+            self._update_summary()
+
+    def poll(self):
+        """Called from the app's poll loop on the Tk thread."""
+        if not self.watcher:
+            return
+        while True:
+            try:
+                stats = self.watcher.results.get_nowait()
+            except queue.Empty:
+                break
+            self._handle(stats)
+
+    def _handle(self, stats):
+        new_rows = []
+        for ev in stats.events:
+            self.events.append(ev)
+            self.counts[ev.kind] += 1
+            if self.write_log.get():
+                detail = f" ({ev.detail})" if ev.detail else ""
+                self.logger.info(f"FILE {ev.kind}: {ev.path} by pid={ev.pid} name={ev.name}{detail}")
+            if self._matches(ev):
+                new_rows.append(ev)
+        for ev in new_rows:
+            self._insert(ev)
+        children = self.tree.get_children()
+        if len(children) > self.MAX_ROWS:
+            self.tree.delete(*children[:len(children) - self.MAX_ROWS])
+        if new_rows and self.autoscroll.get():
+            children = self.tree.get_children()
+            if children:
+                self.tree.see(children[-1])
+        hidden = ""
+        if stats.denied and not winutil.is_admin():
+            hidden = f" · {stats.denied} processes hidden (run as administrator to see them)"
+        self.status = (f"Watching {self.root_dir} · {stats.files} files open by {stats.procs} processes · "
+                       f"scan {stats.scan_ms:.0f} ms{hidden}")
+        self._update_summary()
+
+    # --- list ------------------------------------------------------------
+
+    def _matches(self, ev):
+        kind = self.kind.get()
+        if kind != "All" and ev.kind != kind.upper():
+            return False
+        q = self.query.get().strip().lower()
+        return not q or q in ev.path.lower() or q in ev.name.lower() or q == str(ev.pid)
+
+    def _insert(self, ev):
+        self.tree.insert("", "end", values=(f"{ev.time:%Y-%m-%d %H:%M:%S}", ev.kind, ev.path, ev.name,
+                                            ev.pid, ev.detail), tags=(ev.kind,))
+
+    def rebuild(self):
+        self.tree.delete(*self.tree.get_children())
+        for ev in [e for e in self.events if self._matches(e)][-self.MAX_ROWS:]:
+            self._insert(ev)
+        children = self.tree.get_children()
+        if children and self.autoscroll.get():
+            self.tree.see(children[-1])
+
+    def clear(self):
+        self.events.clear()
+        self.counts = {"OPENED": 0, "CLOSED": 0, "ACTIVITY": 0}
+        self.tree.delete(*self.tree.get_children())
+        self._update_summary()
+
+    def _selected_path(self):
+        sel = self.tree.selection()
+        return self.tree.set(sel[0], "path") if sel else None
+
+    def _popup(self, event):
+        iid = self.tree.identify_row(event.y)
+        if iid:
+            self.tree.selection_set(iid)
+            self.menu.tk_popup(event.x_root, event.y_root)
+
+    def open_location(self):
+        path = self._selected_path()
+        if path and os.path.exists(path):
+            winutil.open_folder(path, select=True)
+
+    def copy_path(self):
+        path = self._selected_path()
+        if path:
+            self.clipboard_clear()
+            self.clipboard_append(path)
+
+    def open_log(self):
+        for handler in self.logger.handlers:
+            handler.flush()
+        if not self.log_path.exists():
+            self.log_path.touch()
+        winutil.open_folder(self.log_path, select=True)
+
+    def _update_summary(self):
+        c = self.counts
+        self.summary.configure(text=f"{self.status}  ·  {c['OPENED']} opened · {c['CLOSED']} closed · "
+                                    f"{c['ACTIVITY']} activity")
+
+
 class TaskPatrolApp(tk.Tk):
     def __init__(self):
         super().__init__(className="TaskPatrol")
@@ -617,9 +855,11 @@ class TaskPatrolApp(tk.Tk):
         self.processes = ProcessesTab(notebook, self)
         self.performance = PerformanceTab(notebook, self)
         self.activity = ActivityTab(notebook, self)
+        self.files = FilesTab(notebook, self)
         notebook.add(self.processes, text="Processes")
         notebook.add(self.performance, text="Performance")
         notebook.add(self.activity, text="Activity log")
+        notebook.add(self.files, text="File activity")
 
         status = ttk.Frame(self, style="Status.TFrame", padding=(10, 4))
         status.pack(fill="x", side="bottom")
@@ -654,6 +894,7 @@ class TaskPatrolApp(tk.Tk):
                 self._ui_calls.get_nowait()()
             except queue.Empty:
                 break
+        self.files.poll()
         try:
             snap = self.sampler.snapshots.get_nowait()
         except queue.Empty:
@@ -671,7 +912,8 @@ class TaskPatrolApp(tk.Tk):
         messagebox.showinfo(
             f"About {DISPLAY_NAME}",
             f"{DISPLAY_NAME}\n\n"
-            "Process killer, CPU / RAM / GPU monitor and process start/stop logger.\n\n"
+            "Process killer, CPU / RAM / GPU monitor, process start/stop logger\n"
+            "and file access monitor.\n\n"
             f"Version: {__version__}\n"
             f"App ID: {APP_ID}\n"
             f"Installer GUID: {{{INSTALLER_GUID}}}\n"
@@ -686,6 +928,7 @@ class TaskPatrolApp(tk.Tk):
 
     def on_close(self):
         self.sampler.stop()
+        self.files.stop_watch()
         if self.activity.write_log.get():
             self.activity.logger.info(f"MONITOR STOPPED: {DISPLAY_NAME}")
         logging.shutdown()
@@ -696,7 +939,8 @@ def main():
     winutil.init_process()
     app = TaskPatrolApp()
     if "--smoke-test" in sys.argv:
-        # Used by CI: open the window, process a few snapshots, then exit cleanly.
-        app.after(4000, app.on_close)
+        # Used by CI: open the window, run the file watcher, process a few snapshots, exit cleanly.
+        app.after(500, app.files.start_watch)
+        app.after(6000, app.on_close)
     app.mainloop()
     return 0

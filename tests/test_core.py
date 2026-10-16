@@ -58,3 +58,49 @@ def test_sampler_produces_snapshots():
     finally:
         sampler.stop()
         sampler.join(timeout=5)
+
+
+def test_file_diff_and_activity(tmp_path):
+    from taskpatrol.filewatch import diff_open_files, io_activity
+
+    now = datetime.now()
+    a, b = str(tmp_path / "a.txt"), str(tmp_path / "b.txt")
+    prev = {a: {(10, "word.exe")}}
+    curr = {a: {(10, "word.exe"), (11, "backup.exe")}, b: {(10, "word.exe")}}
+    events = diff_open_files(prev, curr, now)
+    assert {(e.kind, e.path, e.pid) for e in events} == {("OPENED", a, 11), ("OPENED", b, 10)}
+    assert [(e.kind, e.pid) for e in diff_open_files(curr, {}, now)].count(("CLOSED", 10)) == 2
+
+    acts = io_activity(curr, {10: (100, 0), 11: (0, 0)}, {10: (100, 2048), 11: (0, 0)}, now)
+    assert sorted((e.path, e.detail) for e in acts) == [(a, "write +2.0 KB"), (b, "write +2.0 KB")]
+
+
+def test_path_filter(tmp_path):
+    from taskpatrol.filewatch import PathFilter
+
+    wanted = PathFilter(tmp_path, ignores=[tmp_path / "AppData"])
+    assert wanted(tmp_path / "docs" / "x.txt")
+    assert not wanted(tmp_path / "AppData" / "Local" / "x.db")
+    assert not wanted(str(tmp_path) + "-other/x.txt")
+
+
+def test_file_watcher_sees_open_file(tmp_path):
+    import subprocess
+    import sys
+    import time
+
+    from taskpatrol.filewatch import FileWatcher
+
+    target = tmp_path / "held.txt"
+    target.write_text("x")
+    holder = subprocess.Popen([sys.executable, "-c",
+                               f"f=open({str(target)!r}); import time; time.sleep(30)"])
+    try:
+        time.sleep(1.0)
+        watcher = FileWatcher(tmp_path, interval=0.3)
+        watcher.start()
+        stats = watcher.results.get(timeout=20)
+        watcher.stop()
+        assert any(e.kind == "OPENED" and e.pid == holder.pid for e in stats.events)
+    finally:
+        holder.kill()

@@ -26,6 +26,8 @@ class ProcInfo:
     status: str
     threads: int
     create_time: float
+    read_bps: float = 0.0  # disk I/O bytes per second
+    write_bps: float = 0.0
 
     @property
     def key(self):
@@ -50,6 +52,8 @@ class Snapshot:
     cpu_freq: float = None
     ram: object = None  # psutil.virtual_memory()
     gpu: dict = None
+    disk_read_bps: float = 0.0
+    disk_write_bps: float = 0.0
     first: bool = False
 
 
@@ -70,6 +74,10 @@ class Sampler(threading.Thread):
         self.snapshots = queue.Queue(maxsize=2)
         self._halt = threading.Event()
         self._users = {}  # (pid, create_time) -> username; lookups are slow on Windows
+        self._io = {}  # (pid, create_time) -> (read_bytes, write_bytes) at the previous sample
+        self._disk_io = None
+        self._last = None  # monotonic time of the previous sample
+        self._elapsed = 1.0
         self._ncpu = psutil.cpu_count() or 1
         self._gpu = None
 
@@ -106,14 +114,29 @@ class Sampler(threading.Thread):
 
     def _take(self, previous):
         now = datetime.now()
+        mono = time.monotonic()
+        self._elapsed = max(0.1, mono - self._last) if self._last else 0.0
+        self._last = mono
         procs = {}
         for proc in psutil.process_iter():
             info = self._read(proc)
             if info is not None:
                 procs[info.pid] = info
         live = {p.key for p in procs.values()}
-        for key in self._users.keys() - live:
-            del self._users[key]
+        for cache in (self._users, self._io):
+            for key in cache.keys() - live:
+                del cache[key]
+
+        disk_read = disk_write = 0.0
+        try:
+            disk = psutil.disk_io_counters()
+        except (OSError, RuntimeError):
+            disk = None
+        if disk is not None:
+            if self._disk_io is not None and self._elapsed:
+                disk_read = max(0, disk.read_bytes - self._disk_io[0]) / self._elapsed
+                disk_write = max(0, disk.write_bytes - self._disk_io[1]) / self._elapsed
+            self._disk_io = (disk.read_bytes, disk.write_bytes)
 
         per_cpu = psutil.cpu_percent(percpu=True)
         try:
@@ -135,6 +158,8 @@ class Sampler(threading.Thread):
             cpu_freq=freq,
             ram=psutil.virtual_memory(),
             gpu=gpu,
+            disk_read_bps=disk_read,
+            disk_write_bps=disk_write,
             first=previous is None,
         )
 
@@ -170,7 +195,17 @@ class Sampler(threading.Thread):
                     threads = proc.num_threads()
                 except psutil.AccessDenied:
                     threads = 0
-            return ProcInfo(proc.pid, name, user, cpu, mem, status, threads, ctime)
+                read_bps = write_bps = 0.0
+                try:
+                    io = proc.io_counters()
+                    prev = self._io.get(key)
+                    if prev is not None and self._elapsed:
+                        read_bps = max(0, io.read_bytes - prev[0]) / self._elapsed
+                        write_bps = max(0, io.write_bytes - prev[1]) / self._elapsed
+                    self._io[key] = (io.read_bytes, io.write_bytes)
+                except (psutil.AccessDenied, AttributeError, NotImplementedError):
+                    pass
+            return ProcInfo(proc.pid, name, user, cpu, mem, status, threads, ctime, read_bps, write_bps)
         except (psutil.NoSuchProcess, psutil.ZombieProcess):
             return None
         except psutil.AccessDenied:
