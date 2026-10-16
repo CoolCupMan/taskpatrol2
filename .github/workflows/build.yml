@@ -1,0 +1,76 @@
+name: Build Windows exe
+
+on:
+  push:
+    branches: ["**"]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: python -m pip install -r requirements-build.txt
+
+      - name: Unit tests
+        run: python -m pytest -q tests
+
+      - name: Read version
+        id: meta
+        shell: pwsh
+        run: |
+          $v = python -c "import taskpatrol; print(taskpatrol.__version__)"
+          "version=$v" >> $env:GITHUB_OUTPUT
+
+      - name: Ensure Inno Setup
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe")) {
+            choco install innosetup -y --no-progress
+          }
+
+      - name: Build exe and installer
+        run: python packaging/build.py
+
+      - name: Smoke test portable exe
+        shell: pwsh
+        run: |
+          $exe = "dist\TaskPatrol-${{ steps.meta.outputs.version }}.exe"
+          $p = Start-Process $exe -ArgumentList "--smoke-test" -PassThru
+          if (-not $p.WaitForExit(90000)) { $p.Kill(); throw "exe did not exit" }
+          if ($p.ExitCode -ne 0) { throw "exe exited with $($p.ExitCode)" }
+
+      - name: Test silent install and uninstall
+        shell: pwsh
+        run: |
+          $v = "${{ steps.meta.outputs.version }}"
+          $setup = Start-Process "dist\TaskPatrol-$v-Setup.exe" -ArgumentList "/VERYSILENT","/CURRENTUSER","/SUPPRESSMSGBOXES","/NORESTART" -PassThru -Wait
+          if ($setup.ExitCode -ne 0) { throw "setup exited with $($setup.ExitCode)" }
+          $dir = "$env:LOCALAPPDATA\Programs\TaskPatrol\$v"
+          if (-not (Test-Path "$dir\TaskPatrol-$v.exe")) { throw "exe not installed to $dir" }
+          $un = Get-ChildItem $dir -Filter "unins*.exe" | Select-Object -First 1
+          Start-Process $un.FullName -ArgumentList "/VERYSILENT","/SUPPRESSMSGBOXES","/NORESTART" -Wait
+          Write-Host "Installed and uninstalled $v from $dir"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: TaskPatrol-${{ steps.meta.outputs.version }}-windows
+          path: |
+            dist/TaskPatrol-*.exe
+
+      - name: Publish release (tags only)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/TaskPatrol-*.exe
