@@ -1,6 +1,8 @@
+import multiprocessing
 import sys
 
-from taskpatrol.app import main
-
 if __name__ == "__main__":
+    multiprocessing.freeze_support()
+    from taskpatrol.app import main
+
     sys.exit(main())

@@ -43,13 +43,18 @@ jobs:
       - name: Build exe and installer
         run: python packaging/build.py
 
-      - name: Smoke test portable exe
+      - name: Smoke test portable exe (workers run, window stays responsive)
         shell: pwsh
         run: |
           $exe = "dist\TaskPatrol-${{ steps.meta.outputs.version }}.exe"
-          $p = Start-Process $exe -ArgumentList "--smoke-test" -PassThru
-          if (-not $p.WaitForExit(90000)) { $p.Kill(); throw "exe did not exit" }
+          $report = "$env:RUNNER_TEMP\smoke.txt"
+          $p = Start-Process $exe -ArgumentList "--smoke-test", $report -PassThru
+          if (-not $p.WaitForExit(120000)) { $p.Kill(); throw "exe did not exit" }
+          if (Test-Path $report) { Get-Content $report } else { throw "no smoke report written" }
           if ($p.ExitCode -ne 0) { throw "exe exited with $($p.ExitCode)" }
+          Start-Sleep -Seconds 2
+          $left = Get-Process -Name "TaskPatrol-*" -ErrorAction SilentlyContinue
+          if ($left) { $left | Format-Table Id, ProcessName; throw "worker processes left running" }
 
       - name: Test silent install and uninstall
         shell: pwsh

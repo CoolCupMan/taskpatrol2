@@ -3,11 +3,12 @@ from datetime import datetime
 
 import taskpatrol
 from taskpatrol.gpu import aggregate_engine_usage
-from taskpatrol.sampler import ProcInfo, Sampler, diff_processes
+from taskpatrol.sampler import ProcInfo, Sampler, diff_processes, merge_snapshots, run_sampler
+from taskpatrol.worker import WorkerProcess
 
 
 def proc(pid, name, ctime=100.0):
-    return ProcInfo(pid, name, "user", 0.0, 1.0, "running", 1, ctime)
+    return ProcInfo(pid, name, "user", 0.0, 1.0, 1, ctime)
 
 
 def test_diff_detects_started_and_stopped():
@@ -25,7 +26,7 @@ def test_diff_detects_pid_reuse():
 
 def test_diff_ignores_metric_changes():
     a = proc(5, "x.exe")
-    b = ProcInfo(5, "x.exe", "user", 50.0, 99.0, "running", 4, a.create_time)
+    b = ProcInfo(5, "x.exe", "user", 50.0, 99.0, 4, a.create_time, 10.0, 20.0)
     assert diff_processes({5: a}, {5: b}, datetime.now()) == []
 
 
@@ -49,15 +50,33 @@ def test_identity_is_unique_per_version():
     assert str(other).upper() != taskpatrol.INSTALLER_GUID
 
 
-def test_sampler_produces_snapshots():
-    sampler = Sampler(interval=0.2)
-    sampler.start()
+def test_sampler_take():
+    sampler = Sampler()
     try:
-        first = sampler.snapshots.get(timeout=10)
-        assert first.first and first.procs and first.ram is not None
+        first, second = sampler.take(), sampler.take()
     finally:
-        sampler.stop()
-        sampler.join(timeout=5)
+        sampler.close()
+    assert first.first and first.procs and first.ram.total > 0
+    assert not second.first and second.procs
+
+
+def test_sampler_runs_in_child_process():
+    import os
+    import time
+
+    worker = WorkerProcess(run_sampler, 0.2).start()
+    try:
+        snaps = []
+        deadline = time.monotonic() + 30
+        while len(snaps) < 2 and time.monotonic() < deadline:
+            snaps += worker.drain()
+            time.sleep(0.1)
+    finally:
+        worker.stop()
+    assert len(snaps) >= 2
+    assert os.getpid() in snaps[-1].procs  # the child sees this (parent) process
+    merged = merge_snapshots(snaps)
+    assert merged.first and merged is snaps[-1]
 
 
 def test_file_diff_and_activity(tmp_path):
@@ -89,7 +108,7 @@ def test_file_watcher_sees_open_file(tmp_path):
     import sys
     import time
 
-    from taskpatrol.filewatch import FileWatcher
+    from taskpatrol.filewatch import FileScanner, run_filewatch
 
     target = tmp_path / "held.txt"
     target.write_text("x")
@@ -97,10 +116,19 @@ def test_file_watcher_sees_open_file(tmp_path):
                                f"f=open({str(target)!r}); import time; time.sleep(30)"])
     try:
         time.sleep(1.0)
-        watcher = FileWatcher(tmp_path, interval=0.3)
-        watcher.start()
-        stats = watcher.results.get(timeout=20)
-        watcher.stop()
+        stats = FileScanner(tmp_path).scan()
+        assert stats.first
         assert any(e.kind == "OPENED" and e.pid == holder.pid for e in stats.events)
+
+        worker = WorkerProcess(run_filewatch, str(tmp_path), [], 0.3).start()
+        try:
+            results = []
+            deadline = time.monotonic() + 30
+            while not results and time.monotonic() < deadline:
+                results += worker.drain()
+                time.sleep(0.1)
+        finally:
+            worker.stop()
+        assert any(e.pid == holder.pid for e in results[0].events)
     finally:
         holder.kill()

@@ -7,8 +7,6 @@ the bytes may belong to other files the process has open.
 """
 
 import os
-import queue
-import threading
 import time
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -16,6 +14,8 @@ from datetime import datetime
 from pathlib import Path
 
 import psutil
+
+from taskpatrol.worker import run_loop
 
 
 def fmt_bytes(n):
@@ -104,49 +104,33 @@ def io_activity(open_files, previous_io, current_io, now):
     return events
 
 
-class FileWatcher(threading.Thread):
-    """Scans open files every `interval` seconds and queues ScanStats with events."""
+class FileScanner:
+    """Each scan() lists watched files held open and diffs against the previous scan."""
 
-    def __init__(self, root, ignores=(), interval=2.0):
-        super().__init__(name="TaskPatrolFileWatcher", daemon=True)
+    def __init__(self, root, ignores=()):
         self.root = str(root)
         self.wanted = PathFilter(root, ignores)
-        self.interval = interval
-        self.results = queue.Queue()
-        self._halt = threading.Event()
+        self._previous, self._previous_io = {}, {}
+        self._first = True
 
-    def stop(self):
-        self._halt.set()
+    def scan(self):
+        started = time.monotonic()
+        files, io, procs, denied = self._collect()
+        now = datetime.now()
+        events = (diff_open_files(self._previous, files, now, self._first)
+                  + io_activity(files, self._previous_io, io, now))
+        stats = ScanStats(now, len(files), procs, denied, (time.monotonic() - started) * 1000, self._first, events)
+        self._previous, self._previous_io, self._first = files, io, False
+        return stats
 
-    @property
-    def stopped(self):
-        return self._halt.is_set()
-
-    def run(self):
-        previous, previous_io = {}, {}
-        first = True
-        while not self._halt.is_set():
-            started = time.monotonic()
-            files, io, procs, denied = self._scan()
-            now = datetime.now()
-            events = diff_open_files(previous, files, now, first) + io_activity(files, previous_io, io, now)
-            if self._halt.is_set():
-                break
-            self.results.put(ScanStats(now, len(files), procs, denied,
-                                       (time.monotonic() - started) * 1000, first, events))
-            previous, previous_io, first = files, io, False
-            self._halt.wait(max(0.2, self.interval - (time.monotonic() - started)))
-
-    def _scan(self):
-        own = os.getpid()
+    def _collect(self):
+        own = os.getppid(), os.getpid()  # skip TaskPatrol itself (window and this worker)
         files = defaultdict(set)
         io = {}
         holders = set()
         denied = 0
         for proc in psutil.process_iter(["name"]):
-            if self._halt.is_set():
-                break
-            if proc.pid in (0, 4, own):
+            if proc.pid in (0, 4) or proc.pid in own:
                 continue
             try:
                 opened = proc.open_files()
@@ -168,3 +152,8 @@ class FileWatcher(threading.Thread):
                 except (psutil.Error, OSError, AttributeError, NotImplementedError):
                     pass
         return dict(files), io, len(holders), denied
+
+
+def run_filewatch(out_q, stop, parent_pid, root, ignores=(), interval=2.0):
+    """Child-process entry point."""
+    run_loop(out_q, stop, parent_pid, interval, FileScanner(root, ignores).scan)

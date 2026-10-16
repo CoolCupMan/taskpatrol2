@@ -15,7 +15,9 @@ import psutil
 
 from taskpatrol import APP_ID, DISPLAY_NAME, INSTALLER_GUID, __version__
 from taskpatrol import filewatch, winutil
-from taskpatrol.sampler import Sampler
+from taskpatrol.filewatch import run_filewatch
+from taskpatrol.sampler import merge_snapshots, run_sampler
+from taskpatrol.worker import WorkerProcess
 
 LOG_NAME = "process_activity_log.txt"
 FILE_LOG_NAME = "file_activity_log.txt"
@@ -145,10 +147,12 @@ class Sparkline(tk.Canvas):
         self.color = color
         self.values = deque([0.0] * points, maxlen=points)
         self.bind("<Configure>", lambda e: self.redraw())
+        self.bind("<Map>", lambda e: self.redraw())
 
     def push(self, value):
         self.values.append(max(0.0, min(100.0, value or 0.0)))
-        self.redraw()
+        if self.winfo_ismapped():  # hidden tab: just record, redraw on <Map>
+            self.redraw()
 
     def redraw(self):
         self.delete("all")
@@ -180,10 +184,12 @@ class CoreBars(tk.Canvas):
         super().__init__(parent, height=70, background=C["bg"], highlightthickness=0, **kwargs)
         self.values = []
         self.bind("<Configure>", lambda e: self.redraw())
+        self.bind("<Map>", lambda e: self.redraw())
 
     def set(self, values):
         self.values = list(values)
-        self.redraw()
+        if self.winfo_ismapped():
+            self.redraw()
 
     def redraw(self):
         self.delete("all")
@@ -213,7 +219,6 @@ class ProcessesTab(ttk.Frame):
         ("read", "Disk read", 90, "e"),
         ("write", "Disk write", 90, "e"),
         ("threads", "Threads", 70, "e"),
-        ("status", "Status", 90, "w"),
     )
     SORT_KEYS = {
         "name": lambda p: (p.name.lower(), p.pid),
@@ -224,14 +229,14 @@ class ProcessesTab(ttk.Frame):
         "read": lambda p: p.read_bps,
         "write": lambda p: p.write_bps,
         "threads": lambda p: p.threads,
-        "status": lambda p: (p.status, p.name.lower()),
     }
 
     def __init__(self, parent, app):
         super().__init__(parent, padding=10)
         self.app = app
         self.latest = {}
-        self.rows = {}
+        self.rows = {}  # pid -> ProcInfo currently listed
+        self.shown = {}  # pid -> (values, tags) currently drawn
         self.sort_col, self.sort_desc = "cpu", True
         self.paused = tk.BooleanVar(value=False)
         self.query = tk.StringVar()
@@ -284,7 +289,7 @@ class ProcessesTab(ttk.Frame):
 
     def update_snapshot(self, snap):
         self.latest = snap.procs
-        if not self.paused.get():
+        if not self.paused.get() and self.app.is_visible(self):
             self.render()
 
     def render(self):
@@ -294,18 +299,21 @@ class ProcessesTab(ttk.Frame):
             if not q or q in p.name.lower() or q in p.user.lower() or q == str(pid)
         }
         tree = self.tree
-        stale = [iid for iid in tree.get_children() if int(iid) not in visible]
+        stale = [str(pid) for pid in self.shown if pid not in visible]
         if stale:
             tree.delete(*stale)
+        shown = {}
         for pid, p in visible.items():
-            iid = str(pid)
-            values = (p.name, pid, p.user or "—", f"{p.cpu:.1f}", fmt_mem(p.mem_mb),
-                      fmt_rate(p.read_bps), fmt_rate(p.write_bps), p.threads, p.status)
-            tags = ("hot",) if p.cpu >= 20 else ("system",) if p.name.lower() in PROTECTED else ()
-            if pid not in self.rows or not tree.exists(iid):
-                tree.insert("", "end", iid=iid, values=values, tags=tags)
-            elif self.rows[pid] != p:
-                tree.item(iid, values=values, tags=tags)
+            row = ((p.name, pid, p.user or "—", f"{p.cpu:.1f}", fmt_mem(p.mem_mb),
+                    fmt_rate(p.read_bps), fmt_rate(p.write_bps), p.threads),
+                   ("hot",) if p.cpu >= 20 else ("system",) if p.name.lower() in PROTECTED else ())
+            old = self.shown.get(pid)
+            if old is None:
+                tree.insert("", "end", iid=str(pid), values=row[0], tags=row[1])
+            elif old != row:  # only touch rows whose text actually changed
+                tree.item(str(pid), values=row[0], tags=row[1])
+            shown[pid] = row
+        self.shown = shown
         self.rows = visible
 
         order = [str(p.pid) for p in sorted(visible.values(), key=self.SORT_KEYS[self.sort_col],
@@ -706,8 +714,8 @@ class FilesTab(ttk.Frame):
 
     def start_watch(self):
         ignores = filewatch.default_ignores(os.path.expanduser("~")) if self.skip_appdata.get() else ()
-        self.watcher = filewatch.FileWatcher(self.root_dir, ignores=ignores, interval=2.0)
-        self.watcher.start()
+        self.watcher = WorkerProcess(run_filewatch, self.root_dir, [str(p) for p in ignores], 2.0,
+                                     name="TaskPatrolFiles").start()
         self.toggle.configure(text="Stop watching")
         self.status = f"Scanning {self.root_dir} …"
         if self.write_log.get():
@@ -740,11 +748,7 @@ class FilesTab(ttk.Frame):
         """Called from the app's poll loop on the Tk thread."""
         if not self.watcher:
             return
-        while True:
-            try:
-                stats = self.watcher.results.get_nowait()
-            except queue.Empty:
-                break
+        for stats in self.watcher.drain():
             self._handle(stats)
 
     def _handle(self, stats):
@@ -852,6 +856,7 @@ class TaskPatrolApp(tk.Tk):
 
         notebook = ttk.Notebook(self)
         notebook.pack(fill="both", expand=True)
+        self.notebook = notebook
         self.processes = ProcessesTab(notebook, self)
         self.performance = PerformanceTab(notebook, self)
         self.activity = ActivityTab(notebook, self)
@@ -875,10 +880,18 @@ class TaskPatrolApp(tk.Tk):
 
         self.bind_all("<Control-f>", lambda e: (notebook.select(self.processes), self.processes.search.focus_set()))
         self.protocol("WM_DELETE_WINDOW", self.on_close)
+        notebook.bind("<<NotebookTabChanged>>", self._tab_changed)
 
-        self.sampler = Sampler(interval=1.0)
-        self.sampler.start()
+        self.sampler = WorkerProcess(run_sampler, 1.0, name="TaskPatrolSampler").start()
+        self.snapshots_seen = 0
         self.after(100, self._poll)
+
+    def is_visible(self, tab):
+        return self.notebook.select() == str(tab)
+
+    def _tab_changed(self, event):
+        if self.is_visible(self.processes) and not self.processes.paused.get():
+            self.processes.render()
 
     def call_soon(self, fn):
         """Thread-safe: run fn on the Tk thread."""
@@ -895,11 +908,9 @@ class TaskPatrolApp(tk.Tk):
             except queue.Empty:
                 break
         self.files.poll()
-        try:
-            snap = self.sampler.snapshots.get_nowait()
-        except queue.Empty:
-            snap = None
+        snap = merge_snapshots(self.sampler.drain())
         if snap is not None:
+            self.snapshots_seen += 1
             self.processes.update_snapshot(snap)
             self.performance.update_snapshot(snap)
             self.activity.update_snapshot(snap)
@@ -935,12 +946,55 @@ class TaskPatrolApp(tk.Tk):
         self.destroy()
 
 
+class SmokeTest:
+    """CI check: run every worker, keep the window busy, and verify it stays responsive.
+
+    Writes a report and exits non-zero if no snapshot arrived or the main loop
+    ever stalled for longer than MAX_STALL_MS.
+    """
+
+    MAX_STALL_MS = 1000
+    TICK_MS = 50
+
+    def __init__(self, app, report_path, seconds=12):
+        self.app = app
+        self.report_path = report_path
+        self.worst = 0.0
+        self.last = None
+        self.exit_code = 0
+        app.after(300, app.files.start_watch)
+        tabs = [app.processes, app.performance, app.activity, app.files]
+        for i in range(seconds):  # flip through every tab so each one renders
+            app.after(1000 * i + 500, lambda t=tabs[i % len(tabs)]: app.notebook.select(t))
+        app.after(2000, self._tick)  # measure once the workers are warmed up
+        app.after(seconds * 1000, self._finish)
+
+    def _tick(self):
+        now = time.perf_counter()
+        if self.last is not None:
+            self.worst = max(self.worst, (now - self.last) * 1000 - self.TICK_MS)
+        self.last = now
+        self.app.after(self.TICK_MS, self._tick)
+
+    def _finish(self):
+        ok_data = self.app.snapshots_seen > 0
+        ok_speed = self.worst <= self.MAX_STALL_MS
+        self.exit_code = 0 if ok_data and ok_speed else 3
+        report = (f"snapshots={self.app.snapshots_seen} processes={len(self.app.processes.latest)} "
+                  f"worst_stall_ms={self.worst:.0f} file_events={len(self.app.files.events)} "
+                  f"result={'PASS' if not self.exit_code else 'FAIL'}\n")
+        if self.report_path:
+            with open(self.report_path, "w", encoding="utf-8") as f:
+                f.write(report)
+        self.app.on_close()
+
+
 def main():
     winutil.init_process()
     app = TaskPatrolApp()
+    smoke = None
     if "--smoke-test" in sys.argv:
-        # Used by CI: open the window, run the file watcher, process a few snapshots, exit cleanly.
-        app.after(500, app.files.start_watch)
-        app.after(6000, app.on_close)
+        args = sys.argv[sys.argv.index("--smoke-test") + 1:]
+        smoke = SmokeTest(app, args[0] if args and not args[0].startswith("-") else None)
     app.mainloop()
-    return 0
+    return smoke.exit_code if smoke else 0

@@ -1,19 +1,23 @@
-"""Background sampling of processes and system resources.
+"""Sampling of processes and system resources.
 
-One worker thread polls everything once per interval and hands an
-immutable Snapshot to the UI, so the window never freezes while psutil
-walks a few hundred processes.
+Sampler runs in its own process (see run_sampler and worker.py) and sends a
+picklable Snapshot to the window once per interval.
 """
 
-import queue
-import threading
 import time
+from collections import namedtuple
 from dataclasses import dataclass, field
 from datetime import datetime
 
 import psutil
 
 from taskpatrol.gpu import GpuMonitor
+from taskpatrol.worker import run_loop
+
+Ram = namedtuple("Ram", "total available percent")
+
+# Thread counts need a full system snapshot per process on Windows; refresh them less often.
+THREADS_EVERY = 5
 
 
 @dataclass(frozen=True)
@@ -23,7 +27,6 @@ class ProcInfo:
     user: str
     cpu: float  # percent of the whole machine, like Task Manager
     mem_mb: float
-    status: str
     threads: int
     create_time: float
     read_bps: float = 0.0  # disk I/O bytes per second
@@ -50,7 +53,7 @@ class Snapshot:
     cpu: float = 0.0
     per_cpu: list = field(default_factory=list)
     cpu_freq: float = None
-    ram: object = None  # psutil.virtual_memory()
+    ram: Ram = None
     gpu: dict = None
     disk_read_bps: float = 0.0
     disk_write_bps: float = 0.0
@@ -67,63 +70,36 @@ def diff_processes(previous, current, now):
     return events
 
 
-class Sampler(threading.Thread):
-    def __init__(self, interval=1.0):
-        super().__init__(name="TaskPatrolSampler", daemon=True)
-        self.interval = interval
-        self.snapshots = queue.Queue(maxsize=2)
-        self._halt = threading.Event()
+class Sampler:
+    def __init__(self):
         self._users = {}  # (pid, create_time) -> username; lookups are slow on Windows
         self._io = {}  # (pid, create_time) -> (read_bytes, write_bytes) at the previous sample
+        self._threads = {}  # (pid, create_time) -> thread count
+        self._previous = None
         self._disk_io = None
         self._last = None  # monotonic time of the previous sample
-        self._elapsed = 1.0
+        self._elapsed = 0.0
+        self._tick = 0
         self._ncpu = psutil.cpu_count() or 1
-        self._gpu = None
-
-    def stop(self):
-        self._halt.set()
-
-    def run(self):
         self._gpu = GpuMonitor()
         psutil.cpu_percent(percpu=True)
-        previous = None
-        try:
-            while not self._halt.is_set():
-                started = time.monotonic()
-                snap = self._take(previous)
-                previous = snap.procs
-                self._publish(snap)
-                self._halt.wait(max(0.05, self.interval - (time.monotonic() - started)))
-        finally:
-            self._gpu.close()
 
-    def _publish(self, snap):
-        # Never drop events: if the UI is behind, merge them into the newest snapshot.
-        while True:
-            try:
-                self.snapshots.put_nowait(snap)
-                return
-            except queue.Full:
-                try:
-                    old = self.snapshots.get_nowait()
-                    snap.events = old.events + snap.events
-                    snap.first = snap.first or old.first
-                except queue.Empty:
-                    pass
+    def close(self):
+        self._gpu.close()
 
-    def _take(self, previous):
+    def take(self):
         now = datetime.now()
         mono = time.monotonic()
         self._elapsed = max(0.1, mono - self._last) if self._last else 0.0
         self._last = mono
+        self._tick += 1
         procs = {}
         for proc in psutil.process_iter():
             info = self._read(proc)
             if info is not None:
                 procs[info.pid] = info
         live = {p.key for p in procs.values()}
-        for cache in (self._users, self._io):
+        for cache in (self._users, self._io, self._threads):
             for key in cache.keys() - live:
                 del cache[key]
 
@@ -148,7 +124,9 @@ class Sampler(threading.Thread):
             gpu = self._gpu.sample()
         except Exception:  # GPU is optional; never let it kill the sampler
             gpu = None
+        vm = psutil.virtual_memory()
 
+        previous, self._previous = self._previous, procs
         return Snapshot(
             time=now,
             procs=procs,
@@ -156,7 +134,7 @@ class Sampler(threading.Thread):
             cpu=sum(per_cpu) / len(per_cpu) if per_cpu else 0.0,
             per_cpu=per_cpu,
             cpu_freq=freq,
-            ram=psutil.virtual_memory(),
+            ram=Ram(vm.total, vm.available, vm.percent),
             gpu=gpu,
             disk_read_bps=disk_read,
             disk_write_bps=disk_write,
@@ -187,14 +165,13 @@ class Sampler(threading.Thread):
                     mem = proc.memory_info().rss / (1024 * 1024)
                 except psutil.AccessDenied:
                     mem = 0.0
-                try:
-                    status = proc.status()
-                except psutil.AccessDenied:
-                    status = ""
-                try:
-                    threads = proc.num_threads()
-                except psutil.AccessDenied:
-                    threads = 0
+                threads = self._threads.get(key)
+                if threads is None or self._tick % THREADS_EVERY == 0:
+                    try:
+                        threads = proc.num_threads()
+                    except psutil.AccessDenied:
+                        threads = 0
+                    self._threads[key] = threads
                 read_bps = write_bps = 0.0
                 try:
                     io = proc.io_counters()
@@ -205,8 +182,28 @@ class Sampler(threading.Thread):
                     self._io[key] = (io.read_bytes, io.write_bytes)
                 except (psutil.AccessDenied, AttributeError, NotImplementedError):
                     pass
-            return ProcInfo(proc.pid, name, user, cpu, mem, status, threads, ctime, read_bps, write_bps)
+            return ProcInfo(proc.pid, name, user, cpu, mem, threads, ctime, read_bps, write_bps)
         except (psutil.NoSuchProcess, psutil.ZombieProcess):
             return None
         except psutil.AccessDenied:
-            return ProcInfo(proc.pid, "?", "", 0.0, 0.0, "", 0, 0.0)
+            return ProcInfo(proc.pid, "?", "", 0.0, 0.0, 0, 0.0)
+
+
+def run_sampler(out_q, stop, parent_pid, interval=1.0):
+    """Child-process entry point."""
+    sampler = Sampler()
+    try:
+        run_loop(out_q, stop, parent_pid, interval, sampler.take)
+    finally:
+        sampler.close()
+
+
+def merge_snapshots(snaps):
+    """Fold several snapshots into the newest one without losing any events."""
+    if not snaps:
+        return None
+    latest = snaps[-1]
+    if len(snaps) > 1:
+        latest.events = [e for s in snaps for e in s.events]
+        latest.first = any(s.first for s in snaps)
+    return latest

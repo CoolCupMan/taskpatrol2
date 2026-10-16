@@ -17,16 +17,16 @@ If ending a process fails with *access denied*, use **Restart as administrator**
 
 Each version has its own identity, so you can install and run several versions in parallel. Every identifier comes from `taskpatrol/__init__.py`:
 
-| | Example for 2.1.0 |
+| | Example for 2.1.1 |
 | --- | --- |
-| Exe | `TaskPatrol-2.1.0.exe` (with a Windows version resource) |
-| Installer | `TaskPatrol-2.1.0-Setup.exe` |
+| Exe | `TaskPatrol-2.1.1.exe` (with a Windows version resource) |
+| Installer | `TaskPatrol-2.1.1-Setup.exe` |
 | Installer AppId | deterministic GUID, `uuid5(namespace, "TaskPatrol/<version>")` |
-| Install folder | `%LOCALAPPDATA%\Programs\TaskPatrol\2.1.0` (per-user) or `Program Files\TaskPatrol\2.1.0` |
-| Start menu / Apps & features | `TaskPatrol 2.1.0` |
-| Taskbar AppUserModelID | `CoolCupMan.TaskPatrol.2.1.0` |
-| Data / log folder | `%LOCALAPPDATA%\TaskPatrol\2.1.0` |
-| Mutex (used by the uninstaller) | `TaskPatrol-2.1.0` |
+| Install folder | `%LOCALAPPDATA%\Programs\TaskPatrol\2.1.1` (per-user) or `Program Files\TaskPatrol\2.1.1` |
+| Start menu / Apps & features | `TaskPatrol 2.1.1` |
+| Taskbar AppUserModelID | `CoolCupMan.TaskPatrol.2.1.1` |
+| Data / log folder | `%LOCALAPPDATA%\TaskPatrol\2.1.1` |
+| Mutex (used by the uninstaller) | `TaskPatrol-2.1.1` |
 
 To release a new version, change `__version__` in `taskpatrol/__init__.py` and rebuild. Its installer won't touch older installs. **About** in the app shows the running version's IDs.
 
@@ -34,8 +34,8 @@ To release a new version, change `__version__` in `taskpatrol/__init__.py` and r
 
 GitHub Actions builds every push on Windows (`.github/workflows/build.yml`). It runs the tests, builds the exe and installer, smoke-tests the exe, then does a silent install and uninstall. The first build of each version also commits both files to [`downloads/`](downloads/), giving public direct links:
 
-- [TaskPatrol-2.1.0-Setup.exe](https://github.com/CoolCupMan/taskpatrol2/raw/claude/eloquent-thompson-r90qmf/downloads/TaskPatrol-2.1.0-Setup.exe) (installer)
-- [TaskPatrol-2.1.0.exe](https://github.com/CoolCupMan/taskpatrol2/raw/claude/eloquent-thompson-r90qmf/downloads/TaskPatrol-2.1.0.exe) (portable)
+- [TaskPatrol-2.1.1-Setup.exe](https://github.com/CoolCupMan/taskpatrol2/raw/claude/eloquent-thompson-r90qmf/downloads/TaskPatrol-2.1.1-Setup.exe) (installer)
+- [TaskPatrol-2.1.1.exe](https://github.com/CoolCupMan/taskpatrol2/raw/claude/eloquent-thompson-r90qmf/downloads/TaskPatrol-2.1.1.exe) (portable)
 
 Every run's files are also available under its **Artifacts**. Pushing a `v*` tag also attaches them to a GitHub Release.
 
@@ -43,7 +43,7 @@ To build locally on Windows (Python 3.10+; [Inno Setup 6](https://jrsoftware.org
 
 ```powershell
 pip install -r requirements-build.txt
-python packaging\build.py          # -> dist\TaskPatrol-2.1.0.exe and dist\TaskPatrol-2.1.0-Setup.exe
+python packaging\build.py          # -> dist\TaskPatrol-2.1.1.exe and dist\TaskPatrol-2.1.1-Setup.exe
 ```
 
 To run from source: `pip install -r requirements.txt`, then `python -m taskpatrol`.
