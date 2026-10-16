@@ -32,7 +32,12 @@ To release a new version, change `__version__` in `taskpatrol/__init__.py` and r
 
 ## Getting the exe
 
-GitHub Actions builds every push on Windows (`.github/workflows/build.yml`). It runs the tests, builds the exe and installer, smoke-tests the exe, then does a silent install and uninstall. Download both files from the run's **Artifacts**. Pushing a `v*` tag also attaches them to a GitHub Release.
+GitHub Actions builds every push on Windows (`.github/workflows/build.yml`). It runs the tests, builds the exe and installer, smoke-tests the exe, then does a silent install and uninstall. The first build of each version also commits both files to [`downloads/`](downloads/), giving public direct links:
+
+- [TaskPatrol-2.1.0-Setup.exe](https://github.com/CoolCupMan/taskpatrol2/raw/claude/eloquent-thompson-r90qmf/downloads/TaskPatrol-2.1.0-Setup.exe) (installer)
+- [TaskPatrol-2.1.0.exe](https://github.com/CoolCupMan/taskpatrol2/raw/claude/eloquent-thompson-r90qmf/downloads/TaskPatrol-2.1.0.exe) (portable)
+
+Every run's files are also available under its **Artifacts**. Pushing a `v*` tag also attaches them to a GitHub Release.
 
 To build locally on Windows (Python 3.10+; [Inno Setup 6](https://jrsoftware.org/isinfo.php) is needed only for the installer):
 

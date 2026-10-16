@@ -69,6 +69,20 @@ jobs:
           path: |
             dist/TaskPatrol-*.exe
 
+      - name: Publish exe to downloads/ (once per version)
+        if: github.event_name == 'push' && github.ref_type == 'branch'
+        shell: pwsh
+        run: |
+          $v = "${{ steps.meta.outputs.version }}"
+          if (Test-Path "downloads/TaskPatrol-$v.exe") { Write-Host "TaskPatrol $v already in downloads/"; exit 0 }
+          New-Item -ItemType Directory -Force downloads | Out-Null
+          Copy-Item "dist/TaskPatrol-$v.exe", "dist/TaskPatrol-$v-Setup.exe" downloads/
+          git config user.name "github-actions[bot]"
+          git config user.email "41898585+github-actions[bot]@users.noreply.github.com"
+          git add downloads
+          git commit -m "Publish TaskPatrol $v Windows build [skip ci]"
+          git push origin "HEAD:${{ github.ref_name }}"
+
       - name: Publish release (tags only)
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
